@@ -36,6 +36,7 @@ def column_order(rows: list[dict]) -> list[str]:
 def build_snapshot(run: dict) -> dict:
     """run 为 runner 产出的运行记录（含 result），这里只做结构化与精简。"""
     result = run["result"]
+    published = result.get("mode") == "published"
     tables: dict[str, dict] = {}
     for table, payload in result["tables"].items():
         rows = payload["rows"]
@@ -48,8 +49,16 @@ def build_snapshot(run: dict) -> dict:
             "tombstones": payload["tombstones"],
             "counters": payload["counters"],
             "watermark": payload["watermark"],
+            "version_no": payload.get("version_no"),
+            "version_id": payload.get("version_id"),
+            "pending": {
+                "pending": payload["pending"]["pending"],
+                "applied": payload["pending"]["applied"],
+                "deferred": payload["pending"]["deferred"],
+                "reasons": payload["pending"]["reasons"],
+            } if published else None,
         }
-    return {
+    snapshot = {
         "export": {
             "app": "cdcwater",
             "app_name": "CDC 乱序去重与水位线推进",
@@ -59,6 +68,7 @@ def build_snapshot(run: dict) -> dict:
             "tables": run["tables"],
             "schema_version": run["schema_version"],
             "schema_pair": [result["gate"]["base_version"], result["gate"]["target_version"]],
+            "mode": result.get("mode", "direct"),
         },
         "watermark": result["watermark"],
         "counters": result["counters"],
@@ -68,6 +78,11 @@ def build_snapshot(run: dict) -> dict:
         "late_events": result["late_events"],
         "conflicts": result["conflicts"],
     }
+    if published:
+        snapshot["pending"] = result["pending"]
+        snapshot["versions"] = result["versions"]
+        snapshot["watermark_before"] = result["watermark_before"]
+    return snapshot
 
 
 def dumps(snapshot: dict) -> str:

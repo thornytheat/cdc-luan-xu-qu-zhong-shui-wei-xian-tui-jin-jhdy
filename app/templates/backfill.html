@@ -1,0 +1,293 @@
+{% extends "base.html" %}
+{% block title %}待补队列与发布 · {{ app_short }}{% endblock %}
+{% block crumb %}待补队列{% endblock %}
+{% block meta %}<span class="dot {{ 'warn' if pending_total else 'ok' }}"></span>{{ pending_total }} 条待补 · 结果与水位线同批切换{% endblock %}
+{% block actions %}
+<a class="btn secondary small" href="/workbench">回工作台</a>
+<a class="btn secondary small" href="/api/backfill/state">看 JSON</a>
+{% endblock %}
+{% block status_left %}迟到事件按业务时间入队 · 补齐同键边界后原子切换 · 失败保留旧版本{% endblock %}
+{% block status_right %}{{ app_short }} · 每表独立发布版本{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">待补队列与发布</h1>
+    <p class="page-sub">
+      迟到事件不再直接改写已发布结果：按<strong>业务时间</strong>进入待补队列，
+      补齐<strong>同一键边界前的事件</strong>后，才在同一个事务里一起切换合并结果与水位线；
+      切换失败时已发布版本与水位线原样保留。同一批重试只复用原版本，不新增版本。
+    </p>
+  </div>
+  <div class="page-head-actions">
+    <a class="btn secondary small" href="/workbench">执行合并</a>
+    <a class="btn secondary small" href="/review">复核与导出</a>
+  </div>
+</div>
+
+<div class="kpi-strip">
+  <div class="kpi {% if pending_total %}warn{% endif %}">
+    <div class="k-label">待补事件</div>
+    <div class="k-value">{{ pending_total }}</div>
+    <div class="k-note">按业务时间排队，补入前不改写结果</div>
+  </div>
+  <div class="kpi">
+    <div class="k-label">已发布表</div>
+    <div class="k-value">{{ state.values()|selectattr('current')|list|length }}/{{ state|length }}</div>
+    <div class="k-note">每表一条发布指针</div>
+  </div>
+  {% for name, item in state.items() %}
+  <div class="kpi">
+    <div class="k-label">{{ name }} 水位线</div>
+    <div class="k-value" style="font-size:13px;font-family:var(--font-mono);letter-spacing:0">{{ item.current.watermark if item.current else '—' }}</div>
+    <div class="k-note">v{{ item.current.version_no if item.current else '—' }} · 待补 {{ item.pending_count }}</div>
+  </div>
+  {% endfor %}
+</div>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>按表补齐</h2>
+    <div class="panel-actions"><span class="tag">模块 7 · 待补与发布切换</span></div>
+  </div>
+  <div class="panel-body tight">
+    <form id="backfill-form" data-page="backfill">
+      <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px">
+        <div class="field">
+          <label>表</label>
+          <select name="table" id="backfill-table">
+            {% for name, item in state.items() %}
+            <option value="{{ name }}" {{ 'selected' if name == selected else '' }}>{{ name }}（待补 {{ item.pending_count }}）</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label>业务时间边界 cutoff（UTC，可空 = 全部）</label>
+          <input type="text" name="cutoff" id="backfill-cutoff" placeholder="如 2026-11-10T00:18:00Z">
+          <p class="small muted" style="margin:4px 0 0">补齐 ts ≤ cutoff 的待补事件；同一键边界内的事件会一起纳入本批。</p>
+        </div>
+        <div class="field">
+          <label>目标 schema</label>
+          <select name="schema_version" id="backfill-schema">
+            <option value="2" selected>v2（变更申请）</option>
+            <option value="1">v1（基线自身）</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>演练 / 重试</label>
+          <div class="check-list">
+            <label class="check-item">
+              <input type="checkbox" name="simulate_failure" value="1" id="backfill-fail">
+              <span><strong>模拟失败</strong><div class="small muted">验证回滚：旧版本、旧水位线、待补队列都不动。</div></span>
+            </label>
+          </div>
+        </div>
+      </div>
+      <div class="alert alert-error" id="backfill-error" role="alert" hidden></div>
+      <p class="small muted" style="margin:8px 0 0">
+        批次键 = hash(表 + 补齐后的事件集合 + 目标 schema)。同一批再点一次会命中 <code>reused</code>，版本号不变；
+        失败批次重试复用同一批次键，成功后改为「已切换」。
+      </p>
+    </form>
+  </div>
+  <div class="panel-actions">
+    <button type="submit" id="backfill-btn" form="backfill-form">补齐并切换</button>
+    <button type="button" class="secondary" id="backfill-all-btn">全部补入当前表</button>
+    <span class="small muted" id="backfill-hint" style="align-self:center">补齐前请确认同键边界：页面会列出每键前后结果</span>
+  </div>
+</section>
+
+<section class="panel" id="backfill-result" hidden>
+  <div class="panel-head">
+    <h2>本次补传</h2>
+    <div class="panel-actions"><span class="tag" id="batch-title">—</span></div>
+  </div>
+  <div class="panel-body tight" id="batch-summary"></div>
+  <div class="table-wrap" id="batch-changes"></div>
+</section>
+
+{% for name, item in state.items() %}
+<section class="panel" id="table-{{ name }}">
+  <div class="panel-head">
+    <h2>{{ name }} · 发布 v{{ item.current.version_no if item.current else '—' }}</h2>
+    <div class="panel-actions">
+      <span class="tag {{ 'warn' if item.pending_count else 'ok' }}">待补 {{ item.pending_count }}</span>
+      <span class="tag">已补入 {{ item.applied_count }}</span>
+      <span class="tag mono">{{ item.current.watermark if item.current else '—' }}</span>
+    </div>
+  </div>
+  <div class="panel-body tight">
+    <p class="small muted" style="margin:0">
+      当前发布版本 <span class="mono">{{ item.current.version_id if item.current else '—' }}</span>
+      （来源 {{ item.current.source if item.current else '—' }} · {{ item.current.created_at if item.current else '—' }}）。
+      待补最老业务时间 {{ item.oldest_pending_ts or '—' }}，最新 {{ item.newest_pending_ts or '—' }}。
+    </p>
+  </div>
+
+  <div class="panel-body tight" style="border-top:1px solid var(--line)">
+    <h3 style="margin:0 0 8px">待补队列（按业务时间）</h3>
+  </div>
+  <div class="table-wrap">
+    <table class="dense">
+      <thead>
+        <tr><th>#</th><th>归档行号</th><th>键</th><th class="num">版本</th><th>op</th><th>业务时间</th>
+          <th>待补原因</th><th>键边界</th><th>墓碑版本</th><th>状态</th><th>依据</th></tr>
+      </thead>
+      <tbody>
+        {% for row in item.pending %}
+        <tr class="{{ 'row-late' if row.status != 'applied' else '' }}">
+          <td class="num small muted">{{ row.id }}</td>
+          <td class="mono small nowrap">第 {{ row.line_no }} 行</td>
+          <td class="mono small">{{ row.pk }}</td>
+          <td class="num nowrap">v{{ row.version }}</td>
+          <td class="small">{{ op_labels.get(row.op, row.op) }}</td>
+          <td class="small mono nowrap">{{ row.ts }}</td>
+          <td class="small">
+            <span class="tag {{ 'warn' if row.status != 'applied' else '' }}">{{ row.reason_label }}</span>
+          </td>
+          <td class="small mono nowrap">{{ row.boundary or '—' }}</td>
+          <td class="small">
+            {% if row.tombstone_version %}<span class="tag err">v{{ row.tombstone_version }} 墓碑</span>{% else %}<span class="muted">—</span>{% endif %}
+          </td>
+          <td class="small">
+            <span class="tag {{ 'ok' if row.status == 'applied' else 'warn' }}">{{ row.status_label }}</span>
+            {% if row.batch_key %}<div class="small muted mono">{{ row.batch_key }}</div>{% endif %}
+          </td>
+          <td class="small muted">{{ row.detail }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="11" class="muted">该表待补队列为空。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel-body tight" style="border-top:1px solid var(--line)">
+    <h3 style="margin:0 0 8px">最近一次成功补齐 · 每键前后最终结果</h3>
+    <p class="small muted" style="margin:0">
+      {% if item.latest_batch and item.latest_batch.result.changes %}
+      批次 <span class="mono">{{ item.latest_batch.batch_key }}</span>
+      把待补 {{ item.latest_batch.result.pending_before }} 条中的
+      {{ item.latest_batch.result.pending_count }} 条补入，水位线
+      <span class="mono">{{ item.latest_batch.watermark_before or '—' }}</span> →
+      <span class="mono">{{ item.latest_batch.watermark_after or '—' }}</span>；
+      受影响键 {{ item.latest_batch.affected_keys|join('、') }}，
+      其中 {{ item.latest_batch.result.changed_keys }} 个最终结果发生变化。
+      {% else %}
+      还没有成功补齐的批次：当前结果就是基线发布结果，待补事件未参与。
+      {% endif %}
+    </p>
+  </div>
+  <div class="table-wrap">
+    <table class="dense">
+      <thead><tr><th>键</th><th>变化</th><th>变化字段</th><th>补前最终结果</th><th>补后最终结果</th></tr></thead>
+      <tbody>
+        {% set changes = (item.latest_batch.result.changes if item.latest_batch else []) %}
+        {% for change in changes %}
+        <tr class="{{ 'row-conflict' if change.changed else '' }}">
+          <td class="mono">{{ change.pk }}</td>
+          <td class="small">{{ change.change_type }}</td>
+          <td class="small">{{ change.changed_fields|join('、') or '—' }}</td>
+          <td class="small">
+            {% if change.before %}
+              {% if change.before.deleted %}<span class="tag err">墓碑 v{{ change.before.tombstone_version }}</span>
+                <div class="small muted mono">第 {{ change.before.tombstone_line_no }} 行</div>
+              {% else %}<span class="tag ok">存活 v{{ change.before.version }}</span>
+                <div class="small mono">{{ change.before.ts }}</div>
+                <div class="small muted mono">{{ change.before.after }}</div>
+              {% endif %}
+            {% else %}<span class="muted">不存在</span>{% endif %}
+          </td>
+          <td class="small">
+            {% if change.after %}
+              {% if change.after.deleted %}<span class="tag err">墓碑 v{{ change.after.tombstone_version }}</span>
+                <div class="small muted mono">第 {{ change.after.tombstone_line_no }} 行</div>
+              {% else %}<span class="tag ok">存活 v{{ change.after.version }}</span>
+                <div class="small mono">{{ change.after.ts }}</div>
+                <div class="small muted mono">{{ change.after.after }}</div>
+              {% endif %}
+            {% else %}<span class="muted">不存在</span>{% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="muted">暂无补齐记录；补齐后这里会列出每键前后最终结果。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel-body tight" style="border-top:1px solid var(--line)">
+    <h3 style="margin:0 0 8px">补传批次（含失败 · 前后水位线）</h3>
+    <p class="small muted" style="margin:0">
+      每次补齐一个批次：成功批次切换版本与水位线；失败批次整体回滚，只留审计记录，
+      这里能看到「补前水位线 → 补后水位线」「待补前 → 待补后」与失败原因。
+    </p>
+  </div>
+  <div class="table-wrap">
+    <table class="dense">
+      <thead>
+        <tr><th>批次键</th><th>状态</th><th>待补原因</th><th class="num">补齐事件</th><th class="num">待补（前→后）</th>
+          <th>补前水位线</th><th>补后水位线</th><th>版本</th><th class="num">尝试 / 复用</th><th>失败原因</th><th>时间</th></tr>
+      </thead>
+      <tbody>
+        {% for batch in item.batches %}
+        <tr class="{{ 'row-conflict' if batch.status == 'failed' else '' }}">
+          <td class="small mono">{{ batch.batch_key }}</td>
+          <td class="small"><span class="tag {{ 'err' if batch.status == 'failed' else 'ok' }}">{{ batch.status_label }}</span></td>
+          <td class="small">{{ batch.reason_labels|join('、') or '—' }}</td>
+          <td class="num small">{{ batch.pending_before - batch.pending_after }}</td>
+          <td class="num small">{{ batch.pending_before }} → {{ batch.pending_after }}</td>
+          <td class="small mono nowrap">{{ batch.watermark_before or '—' }}</td>
+          <td class="small mono nowrap">{{ batch.watermark_after or '—' }}</td>
+          <td class="small mono">{{ ('v' ~ batch.version_no ~ '（自 v' ~ batch.version_before ~ '）') if batch.version_no else '—' }}</td>
+          <td class="num small">{{ batch.attempts }} / {{ batch.replayed }}</td>
+          <td class="small muted">{{ batch.error or '—' }}</td>
+          <td class="small muted nowrap">{{ batch.created_at }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="11" class="muted">该表还没有补传批次。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel-body tight" style="border-top:1px solid var(--line)">
+    <h3 style="margin:0 0 8px">已发布版本（最终结果快照）</h3>
+    <p class="small muted" style="margin:0">每个版本都保存当时的最终行、墓碑、冲突与水位线；失败批次不产生版本。</p>
+  </div>
+  <div class="table-wrap">
+    <table class="dense">
+      <thead>
+        <tr><th>版本</th><th>来源</th><th>批次键</th><th>状态</th><th>补前水位线</th><th>补后水位线</th>
+          <th class="num">待补（前→后）</th><th class="num">尝试</th><th>失败原因</th><th>生成时间</th></tr>
+      </thead>
+      <tbody>
+        {% for entry in item.versions %}
+        {% set batch = entry.batch %}
+        <tr class="{{ 'row-conflict' if batch and batch.status == 'failed' else '' }}">
+          <td class="nowrap mono">{{ entry.version.version_id }}</td>
+          <td class="small">{{ entry.version.source }}</td>
+          <td class="small mono">{{ entry.version.batch_key }}</td>
+          <td class="small">
+            <span class="tag {{ 'err' if batch and batch.status == 'failed' else 'ok' }}">{{ batch.status_label if batch else '已发布' }}</span>
+          </td>
+          <td class="small mono nowrap">{{ (batch.watermark_before or '—') if batch else '—' }}</td>
+          <td class="small mono nowrap">{{ entry.version.watermark or '—' }}</td>
+          <td class="num small">{{ (batch.pending_before|string + ' → ' + batch.pending_after|string) if batch else '—' }}</td>
+          <td class="num small">{{ batch.attempts if batch else '—' }}</td>
+          <td class="small muted">{{ batch.error if batch and batch.error else '—' }}</td>
+          <td class="small muted nowrap">{{ entry.version.created_at }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="10" class="muted">该表还没有发布版本。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endfor %}
+{% endblock %}
+
+{% block scripts %}
+<script>window.__backfill = true;</script>
+{% endblock %}

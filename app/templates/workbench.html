@@ -71,7 +71,8 @@
         <details class="help" style="margin-top:4px">
           <summary>合并口径（迟到 / 同版本 / 墓碑 / 水位线）</summary>
           <ul class="list small" style="margin-bottom:0">
-            <li><strong>迟到</strong>：按文件行序处理，事件 <code>ts</code> 小于「当前已处理最大 ts」即判迟到（相等不算）。</li>
+            <li><strong>迟到</strong>：按文件行序处理，事件 <code>ts</code> 小于「当前已处理最大 ts」即判迟到（相等不算）；
+              迟到事件按业务时间进入待补队列，补齐同键边界后才同批切换结果与水位线。</li>
             <li><strong>同版本</strong>：内容按字段排序后逐字比较；一致 → 静默去重；不一致 → 冲突且保留先到内容。</li>
             <li><strong>墓碑</strong>：<code>op=d</code> 一旦写入就保留；之后版本更低的事件不改状态，只计 <code>ignored_after_tombstone</code>。</li>
             <li><strong>水位线</strong>：<code>min(每个键已处理事件的最大 ts)</code>；高于水位线的键为未闭合键。</li>
@@ -98,10 +99,10 @@
         <div class="k-value">{{ last.summary.conflicts if last else 0 }}</div>
         <div class="k-note">{{ last.created_at if last else '尚未运行过' }}</div>
       </div>
-      <div class="kpi {% if last and last.summary.late %}warn{% endif %}">
-        <div class="k-label">最近运行迟到</div>
-        <div class="k-value">{{ last.summary.late if last else 0 }}</div>
-        <div class="k-note">含 {{ last.summary.ignored_after_tombstone if last else 0 }} 条墓碑后忽略</div>
+      <div class="kpi {% if pending_total %}warn{% endif %}">
+        <div class="k-label">待补队列</div>
+        <div class="k-value">{{ pending_total }}</div>
+        <div class="k-note">最近运行迟到 {{ last.summary.late if last else 0 }} 条，未改写已发布结果</div>
       </div>
       <div class="kpi {% if last and last.summary.gate_verdict == 'blocked' %}err{% elif last %}warn{% endif %}">
         <div class="k-label">最近门禁结论</div>
@@ -114,6 +115,45 @@
         <div class="k-note">本次门禁阻断条数</div>
       </div>
     </div>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>待补队列（按业务时间 · 补齐前不改写结果）</h2>
+        <div class="panel-actions">
+          <span class="tag {{ 'warn' if pending_total else 'ok' }}">{{ pending_total }} 条待补</span>
+          <a class="btn secondary small" href="/backfill">管理待补 / 切换发布</a>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>表</th><th class="num">待补</th><th class="num">已补入</th><th>最老业务时间</th><th>当前水位线</th><th>发布版本</th><th>待补原因</th></tr></thead>
+          <tbody>
+            {% for name, item in backfill_state.items() %}
+            <tr>
+              <td class="nowrap"><strong>{{ name }}</strong></td>
+              <td class="num">{{ item.pending_count }}</td>
+              <td class="num">{{ item.applied_count }}</td>
+              <td class="small mono nowrap">{{ item.oldest_pending_ts or '—' }}</td>
+              <td class="small mono nowrap">{{ item.current.watermark if item.current else '—' }}</td>
+              <td class="small mono">{{ ('v' ~ item.current.version_no) if item.current else '—' }}</td>
+              <td class="small">
+                {% for row in item.open[:3] %}
+                <span class="tag warn">{{ row.reason_label }} · 第 {{ row.line_no }} 行 · v{{ row.version }}</span>
+                {% else %}<span class="muted">无</span>{% endfor %}
+                {% if item.open|length > 3 %}<span class="small muted">…另有 {{ item.open|length - 3 }} 条</span>{% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-body tight">
+        <p class="small muted" style="margin:0">
+          补齐时按业务时间选批；同一键边界内的事件连同已选事件一起纳入本批，补齐后才在<strong>同一事务</strong>
+          切换最终结果与水位线。失败批次整体回滚，旧版本继续对外；同一批重试只复用原版本，不新增版本。
+        </p>
+      </div>
+    </section>
 
     <section class="panel" id="m2">
       <div class="panel-head">
@@ -128,7 +168,7 @@
           <li data-step="archive"><span class="dot"></span>归档事件（读取 SQLite 中的 CDC 事件）</li>
           <li data-step="merge"><span class="dot"></span>同键合并（最大版本 / 同版本去重或冲突）</li>
           <li data-step="tomb"><span class="dot"></span>墓碑处理（忽略墓碑后低版本）</li>
-          <li data-step="wm"><span class="dot"></span>迟到判定与水位线推进</li>
+          <li data-step="wm"><span class="dot"></span>迟到判定 → 待补队列（不改写已发布结果）</li>
           <li data-step="gate"><span class="dot"></span>Schema 门禁逐条结论</li>
           <li data-step="snap"><span class="dot"></span>快照组装与落库</li>
         </ol>
@@ -212,11 +252,11 @@
       <div class="panel-body tight">
         <p class="small" style="margin:0 0 4px">
           按文件行序处理，事件 <code>ts</code> 小于「当前已处理最大 ts」即判迟到（相等不算）；
-          迟到事件仍按版本规则参与合并，位置按「表 + 文件行号 + 键 + 版本」记录。
+          迟到事件不再直接改写已发布结果，而是按业务时间进入待补队列（见「待补队列」页）。
         </p>
         <p class="small muted" style="margin:0">
           <code>watermark = min(每个键已处理事件的最大 ts)</code>，水位线及以下的键视为已闭合；
-          高于水位线的键为未闭合键，暂不能清理其墓碑。
+          补齐待补事件时，新版本的最终结果与水位线在同一事务切换，失败则保留旧版本。
         </p>
       </div>
     </section>

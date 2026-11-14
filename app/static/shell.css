@@ -520,3 +520,9 @@ details.help[open] > summary { margin-bottom: 6px; }
   .kpi-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .appbar { padding: 0 12px; gap: 8px; }
 }
+
+/* 待补队列：侧栏徽标复用 badge，warn 变体提醒还有事件未补入 */
+.side-nav a .badge.warn {
+  background: rgba(255, 176, 32, .2);
+  color: #ffd48a;
+}

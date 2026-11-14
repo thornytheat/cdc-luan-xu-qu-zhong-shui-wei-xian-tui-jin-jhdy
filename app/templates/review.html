@@ -38,10 +38,10 @@
     <div class="k-value">{{ selected.summary.conflicts if selected else 0 }}</div>
     <div class="k-note">保留先到内容，需人工裁决</div>
   </div>
-  <div class="kpi {% if selected and selected.summary.late %}warn{% endif %}">
-    <div class="k-label">本次迟到事件</div>
-    <div class="k-value">{{ selected.summary.late if selected else 0 }}</div>
-    <div class="k-note">含 {{ selected.summary.ignored_after_tombstone if selected else 0 }} 条墓碑后忽略</div>
+  <div class="kpi {% if selected and selected.summary.pending %}warn{% endif %}">
+    <div class="k-label">本次待补迟到</div>
+    <div class="k-value">{{ selected.summary.pending if selected else 0 }}</div>
+    <div class="k-note">未改写已发布结果 · 墓碑后 {{ selected.summary.pending_tombstone if selected else 0 }} 条</div>
   </div>
 </div>
 
@@ -58,7 +58,7 @@
     <table class="dense" id="runs-table" data-export-name="cdcwater-runs.csv">
       <thead>
         <tr><th>运行</th><th>时间</th><th>表</th><th>schema</th><th class="num">最终行</th>
-          <th class="num">冲突</th><th class="num">迟到</th><th class="num">墓碑后忽略</th>
+          <th class="num">冲突</th><th class="num">待补</th><th class="num">墓碑后待补</th>
           <th>水位线 / 未闭合</th><th>门禁</th><th>操作</th></tr>
       </thead>
       <tbody>
@@ -70,8 +70,8 @@
           <td class="small">v{{ run.schema_version }}</td>
           <td class="num">{{ run.summary.alive_rows }}</td>
           <td class="num">{{ run.summary.conflicts }}</td>
-          <td class="num">{{ run.summary.late }}</td>
-          <td class="num">{{ run.summary.ignored_after_tombstone }}</td>
+          <td class="num">{{ run.summary.pending if run.summary.pending is defined else run.summary.late }}</td>
+          <td class="num">{{ run.summary.pending_tombstone if run.summary.pending_tombstone is defined else run.summary.ignored_after_tombstone }}</td>
           <td class="small"><span class="mono nowrap" style="font-size:11.5px">{{ run.summary.watermark }}</span><div class="small muted">未闭合 {{ run.summary.open_keys }}</div></td>
           <td><span class="tag {{ 'err' if run.summary.gate_verdict == 'blocked' else ('warn' if run.summary.gate_verdict == 'compatible_with_backfill' else 'ok') }}">{{ verdict_labels.get(run.summary.gate_verdict, run.summary.gate_verdict) }}</span></td>
           <td class="small">
@@ -177,7 +177,8 @@
               <span class="small muted">（可放行 {{ selected.result.gate.counts.compatible }} / 回填 {{ selected.result.gate.counts.compatible_with_backfill }} / 阻断 {{ selected.result.gate.counts.blocked }}）</span>
             </td></tr>
             <tr><th>最终行 / 墓碑</th><td class="small">{{ selected.summary.alive_rows }} 行 / {{ selected.summary.tombstones }} 个墓碑</td></tr>
-            <tr><th>冲突 / 迟到</th><td class="small">{{ selected.summary.conflicts }} 条冲突 / {{ selected.summary.late }} 条迟到（{{ selected.summary.ignored_after_tombstone }} 条墓碑后忽略）</td></tr>
+            <tr><th>冲突 / 待补</th><td class="small">{{ selected.summary.conflicts }} 条冲突 / {{ selected.summary.pending if selected.summary.pending is defined else selected.summary.late }} 条待补（{{ selected.summary.pending_tombstone if selected.summary.pending_tombstone is defined else selected.summary.ignored_after_tombstone }} 条墓碑后）</td></tr>
+            <tr><th>发布版本</th><td class="small mono">{% for table, no in (selected.summary.published_version or {}).items() %}{{ table }} v{{ no }}{% if not loop.last %} · {% endif %}{% endfor %}</td></tr>
             <tr><th>水位线</th><td class="small mono">{{ selected.summary.watermark }}</td></tr>
             <tr><th>未闭合键</th><td class="small">{{ selected.summary.open_keys }} / {{ selected.summary['keys'] }}</td></tr>
           </tbody>

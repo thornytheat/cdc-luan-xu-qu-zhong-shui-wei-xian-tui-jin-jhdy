@@ -44,13 +44,16 @@ def test_merge_success_returns_expected_summary(client):
     assert body["run_id"].startswith("R")
     summary = body["summary"]
     assert summary["conflicts"] == 3
-    assert summary["late"] == 8
-    assert summary["ignored_after_tombstone"] == 2
+    assert summary["late"] == 8                 # 迟到事件全部待补，不改写已发布结果
+    assert summary["pending"] == 8
+    assert summary["pending_tombstone"] == 2    # 两条墓碑后迟到保留在队列
+    assert summary["ignored_after_tombstone"] == 0
     assert summary["deduped_silent"] == 1
     assert summary["alive_rows"] == 40
     assert summary["tombstones"] == 2
     assert summary["watermark"] == "2026-11-10T00:14:00Z"
     assert summary["open_keys"] == 33
+    assert summary["published_version"] == {"orders": 1, "customers": 1, "inventory": 1}
     assert summary["gate_verdict"] == "blocked"
     assert summary["gate_counts"] == {"compatible": 3, "compatible_with_backfill": 1, "blocked": 5}
     assert body["result_url"] == f"/result/{body['run_id']}"
@@ -118,11 +121,14 @@ def test_snapshot_download_contains_full_payload(client):
     assert snapshot["counters"]["conflicts"] == 3
     assert snapshot["counters"]["late"] == 8
     assert snapshot["watermark"]["watermark"] == "2026-11-10T00:14:00Z"
+    assert snapshot["tables"]["orders"]["pending"]["pending"] == 3
     assert snapshot["gate"]["verdict"] == "blocked"
     assert set(snapshot["tables"]) == {"orders", "customers", "inventory"}
     assert snapshot["tables"]["orders"]["row_count"] == 13
-    assert len(snapshot["changelog"]) == 180
+    assert len(snapshot["changelog"]) == 172     # 180 - 8 条待补（未参与已发布结果）
     assert len(snapshot["late_events"]) == 8
+    assert len(snapshot["pending"]["orders"]["rows"]) == 3
+    assert snapshot["export"]["mode"] == "published"
 
 
 def test_review_page_lists_runs_and_changelog(client):

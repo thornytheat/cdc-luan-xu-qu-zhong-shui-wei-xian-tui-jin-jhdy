@@ -1,9 +1,10 @@
 {% extends "base.html" %}
 {% block title %}合并结果 {{ run.run_id }} · {{ app_short }}{% endblock %}
 {% block crumb %}合并结果{% endblock %}
-{% block meta %}{% set v = summary.gate_verdict %}<span class="dot {{ 'err' if v == 'blocked' else ('warn' if v == 'compatible_with_backfill' else 'ok') }}"></span>总判定 {{ verdict_labels.get(v, v) }} · {{ summary.conflicts }} 冲突 · {{ summary.late }} 迟到{% endblock %}
+{% block meta %}{% set v = summary.gate_verdict %}<span class="dot {{ 'err' if v == 'blocked' else ('warn' if v == 'compatible_with_backfill' else 'ok') }}"></span>总判定 {{ verdict_labels.get(v, v) }} · {{ summary.conflicts }} 冲突 · {{ summary.late }} 待补{% endblock %}
 {% block actions %}
 <a class="btn secondary small" href="/workbench">回工作台</a>
+<a class="btn secondary small" href="/backfill">待补队列</a>
 <a class="btn small" href="/api/runs/{{ run.run_id }}/snapshot">下载快照 JSON</a>
 {% endblock %}
 {% block status_left %}run_id {{ run.run_id }} · 生成于 {{ run.created_at }} · 快照 {{ (snapshot_bytes / 1024) | round(1) }} KB{% endblock %}
@@ -41,10 +42,10 @@
     <div class="k-value">{{ summary.conflicts }}</div>
     <div class="k-note">需人工裁决，保留先到内容</div>
   </div>
-  <div class="kpi {% if summary.late %}warn{% endif %}">
-    <div class="k-label">迟到事件</div>
-    <div class="k-value">{{ summary.late }}</div>
-    <div class="k-note">含 {{ summary.ignored_after_tombstone }} 条墓碑后忽略</div>
+  <div class="kpi {% if summary.pending %}warn{% endif %}">
+    <div class="k-label">待补迟到事件</div>
+    <div class="k-value">{{ summary.pending }}</div>
+    <div class="k-note">已入队，未改写已发布结果</div>
   </div>
   <div class="kpi">
     <div class="k-label">删除墓碑</div>
@@ -61,6 +62,14 @@
     <div class="k-value">{{ summary.open_keys }}/{{ summary['keys'] }}</div>
     <div class="k-note">还在等更晚事件，暂不能清墓碑</div>
   </div>
+</div>
+
+<div class="alert alert-info" style="margin:0 0 12px">
+  <strong>发布口径：</strong>本次结果来自已发布版本
+  {% for table, version in result.versions.items() %}<span class="mono">{{ table }} v{{ version.version_no }}</span>{% if not loop.last %} · {% endif %}{% endfor %}。
+  <strong>{{ summary.pending }} 条迟到事件</strong>按业务时间进入待补队列（水位线以内 {{ summary.pending_reasons.get('within_watermark', 0) }} 条 ·
+  边界外 {{ summary.pending_reasons.get('late_arrival', 0) }} 条，其中墓碑后 {{ summary.pending_tombstone }} 条），
+  补齐前不改写任何已发布行；到 <a href="/backfill">待补队列</a> 查看每键前后结果并同批切换结果与水位线。
 </div>
 
 <div class="panel">
@@ -84,7 +93,8 @@
       <p class="small" style="margin:0">
         <strong>合并：</strong>{{ summary.alive_rows }} 行最终态 + {{ summary.tombstones }} 个墓碑（共 {{ summary['keys'] }} 个键）；
         <strong>{{ summary.conflicts }} 条同版本冲突</strong>需人工裁决，另有 {{ summary.deduped_silent }} 条同内容重复已静默去重、
-        {{ summary.superseded }} 条低版本被丢弃。
+        {{ summary.superseded }} 条低版本被丢弃。<strong>{{ summary.pending }} 条迟到事件</strong>仍在待补队列，
+        因此在补齐前不参与本结果，也不会改写已发布版本。
       </p>
     </div>
 
@@ -96,8 +106,9 @@
         <thead>
           <tr>
             <th>表</th><th class="num">事件</th><th class="num">键</th><th class="num">最终行</th>
-            <th class="num">墓碑</th><th class="num">冲突</th><th class="num">迟到</th>
-            <th class="num">低版本丢弃</th><th class="num">墓碑后忽略</th><th>表水位线</th><th class="num">未闭合</th>
+            <th class="num">墓碑</th><th class="num">冲突</th><th class="num">待补</th>
+            <th class="num">低版本丢弃</th><th class="num">墓碑后忽略</th><th>当前水位线</th>
+            <th>补前水位线</th><th class="num">未闭合</th><th>发布版本</th>
           </tr>
         </thead>
         <tbody>
@@ -109,11 +120,13 @@
             <td class="num">{{ payload.row_count }}</td>
             <td class="num">{{ payload.tombstone_count }}</td>
             <td class="num">{{ payload.counters.conflicts }}</td>
-            <td class="num">{{ payload.counters.late }}</td>
+            <td class="num {% if payload.pending.pending %}warn{% endif %}">{{ payload.pending.pending }}</td>
             <td class="num">{{ payload.counters.superseded }}</td>
             <td class="num">{{ payload.counters.ignored_after_tombstone }}</td>
             <td class="small mono nowrap">{{ payload.watermark.watermark }}</td>
+            <td class="small mono nowrap muted">{{ result.watermark_before.get(table) or '—' }}</td>
             <td class="num">{{ payload.watermark.open_keys }}</td>
+            <td class="small mono nowrap">v{{ payload.version_no }}<div class="small muted">{{ payload.version_id }}</div></td>
           </tr>
           {% endfor %}
         </tbody>
@@ -256,8 +269,8 @@
   <div id="tab-late" class="tab-panel" hidden>
     <div class="panel-body tight">
       <p class="small" style="margin:0 0 4px">
-        <strong>乱序：</strong><strong>{{ summary.late }} 条迟到</strong>事件仍按版本规则参与合并；
-        其中 {{ summary.ignored_after_tombstone }} 条落在删除墓碑之后，已按规则忽略。
+        <strong>乱序：</strong><strong>{{ summary.late }} 条迟到</strong>事件按业务时间进入待补队列，
+        <strong>未参与</strong>本次已发布结果；其中 {{ summary.pending_tombstone }} 条落在删除墓碑之后，补入时仍按墓碑规则忽略。
       </p>
       <p class="small" style="margin:0">
         <strong>水位线：</strong><span class="mono">{{ summary.watermark }}</span>，
@@ -266,17 +279,18 @@
     </div>
 
     <div class="panel-body tight" style="border-top:1px solid var(--line)">
-      <h3 style="margin:0 0 8px">迟到事件（{{ late_rows|length }} 条 · 逐条位置）</h3>
+      <h3 style="margin:0 0 8px">待补事件（{{ late_rows|length }} 条 · 逐条位置与原因）</h3>
       <p class="small muted" style="margin:0">
         判定口径：按文件行序处理，事件 ts &lt; 当时「已处理最大 ts」即判迟到（相等不算）。
-        迟到事件仍然参与版本合并，位置按「表 + 文件行号 + 键 + 版本」记录。
+        迟到事件只入待补队列：业务时间不晚于该键边界 →「水位线以内迟到」，否则「到达顺序迟到」；
+        补齐同键边界前事件后，才在 <a href="/backfill">待补队列</a> 同批切换结果与水位线。
       </p>
     </div>
     <div class="table-wrap">
       <table class="dense">
         <thead>
-          <tr><th>表</th><th>归档行号</th><th>键</th><th class="num">版本</th><th>事件 ts</th>
-            <th>当时最大 ts</th><th class="num">落后</th><th>合并结果</th></tr>
+          <tr><th>表</th><th>归档行号</th><th>键</th><th class="num">版本</th><th>业务时间 ts</th>
+            <th>该键边界</th><th>待补原因</th><th>当前处理</th><th>依据</th></tr>
         </thead>
         <tbody>
           {% for item in late_rows %}
@@ -286,12 +300,15 @@
             <td class="mono">{{ item.pk }}</td>
             <td class="num">v{{ item.version }}</td>
             <td class="small mono nowrap">{{ item.ts }}</td>
-            <td class="small mono nowrap">{{ item.running_max_ts }}</td>
-            <td class="num small">{{ item.behind_seconds }}s</td>
+            <td class="small mono nowrap">{{ item.boundary or '—' }}</td>
             <td class="small">
-              <span class="tag {{ 'warn' if item.after_tombstone else ('ok' if item.kind in ('apply_update', 'apply_insert', 'applied_delete') else '') }}">{{ item.kind_label }}</span>
-              <div class="small muted">{{ item.reason }}</div>
+              <span class="tag warn">{{ item.reason_label }}</span>
+              {% if item.after_tombstone %}<span class="tag err">墓碑后</span>{% endif %}
             </td>
+            <td class="small">
+              <span class="tag {{ 'ok' if item.status == 'applied' else 'warn' }}">{{ '已补入' if item.status == 'applied' else '待补（未参与发布）' }}</span>
+            </td>
+            <td class="small muted">{{ item.detail }}</td>
           </tr>
           {% endfor %}
         </tbody>

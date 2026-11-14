@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from . import archive, runner, schema_gate, settings, snapshot, store
+from . import archive, backfill, runner, schema_gate, settings, snapshot, store
 from .archive import EventError
 
 BASE_DIR = settings.BASE_DIR
@@ -37,6 +37,18 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "app" / "templates"))
 class MergeRequest(BaseModel):
     tables: list[str] = Field(default_factory=list, description="要合并的表名")
     schema_version: int = Field(2, ge=1, le=2, description="要评估的目标 schema 版本")
+    mode: str = Field("published", description="published（默认，迟到进待补队列）/ direct（全量直算，仅对照）")
+
+
+class BackfillRequest(BaseModel):
+    table: str = Field(..., description="表名")
+    cutoff: str | None = Field(
+        default=None,
+        description="补齐业务时间 <= cutoff 的待补事件；留空表示全部；all 亦表示全部",
+    )
+    schema_version: int = Field(2, ge=1, le=2)
+    batch_key: str | None = Field(default=None, description="重试已存在的批次（同一键不新增版本）")
+    simulate_failure: bool = Field(False, description="演练失败：验证旧版本与旧水位线被保留")
 
 
 def render(request: Request, template: str, **ctx) -> HTMLResponse:
@@ -48,6 +60,7 @@ def render(request: Request, template: str, **ctx) -> HTMLResponse:
         "verdict_labels": settings.VERDICT_LABELS,
         "change_labels": settings.CHANGE_LABELS,
         "op_labels": settings.OP_LABELS,
+        "pending_total": 0,
         "nav": ctx.pop("nav", ""),
     }
     context.update(ctx)
@@ -83,6 +96,7 @@ def index(request: Request):
     conn = with_conn()
     try:
         overview = store.event_overview(conn)
+        pending_state = backfill.state(conn, settings.TABLE_NAMES)
         meta = {
             "seed_version": store.get_meta(conn, "seed_version"),
             "seeded_at": store.get_meta(conn, "seeded_at"),
@@ -111,6 +125,8 @@ def index(request: Request):
         stats=stats,
         embedded=settings.EMBEDDED,
         steps=settings.DEMO_STEPS,
+        backfill_state=pending_state,
+        pending_total=sum(item["pending_count"] for item in pending_state.values()),
         schema_v1=schema_gate.load_schema(settings.SCHEMAS_DIR / "v1.json"),
         schema_v2=schema_gate.load_schema(settings.SCHEMAS_DIR / "v2.json"),
         changes=schema_gate.structural_changes(
@@ -127,6 +143,7 @@ def workbench(request: Request):
     try:
         overview = store.event_overview(conn)
         recent = store.list_runs(conn, limit=5)
+        pending_state = backfill.state(conn, settings.TABLE_NAMES)
     finally:
         conn.close()
     return render(
@@ -136,6 +153,8 @@ def workbench(request: Request):
         nav="workbench",
         overview=overview,
         recent=recent,
+        backfill_state=pending_state,
+        pending_total=sum(item["pending_count"] for item in pending_state.values()),
         schema_v1=schema_gate.load_schema(settings.SCHEMAS_DIR / "v1.json"),
         schema_v2=schema_gate.load_schema(settings.SCHEMAS_DIR / "v2.json"),
     )
@@ -146,6 +165,7 @@ def result_page(request: Request, run_id: str):
     conn = with_conn()
     try:
         run = store.get_run(conn, run_id)
+        backfill_state = backfill.state(conn, run["tables"]) if run else {}
     finally:
         conn.close()
     if run is None:
@@ -171,8 +191,9 @@ def result_page(request: Request, run_id: str):
         entry = change_by_line.get((item["table"], item["line_no"]), {})
         row["after_tombstone"] = item["line_no"] in ignored.get(item["table"], set())
         row["kind"] = entry.get("kind", "")
-        row["kind_label"] = entry.get("kind_label", "已处理")
-        row["reason"] = entry.get("reason", "")
+        row["kind_label"] = entry.get("kind_label", "待补（未参与发布）")
+        row["reason_label"] = backfill.REASON_LABELS.get(item.get("reason", ""), item.get("reason", ""))
+        row["detail"] = item.get("detail", "") or entry.get("reason", "")
         late_rows.append(row)
     return render(
         request,
@@ -185,11 +206,34 @@ def result_page(request: Request, run_id: str):
         snapshot=snap,
         preview=preview,
         late_rows=late_rows,
+        backfill_state=backfill_state,
+        pending_total=sum(item["pending_count"] for item in backfill_state.values()),
         snapshot_bytes=snapshot.snapshot_size(snap),
         base_schema=schema_gate.load_schema(settings.SCHEMAS_DIR / "v1.json"),
         target_schema=schema_gate.load_schema(
             settings.SCHEMAS_DIR / f"v{run['schema_version']}.json"
         ),
+    )
+
+
+@app.get("/backfill", response_class=HTMLResponse)
+def backfill_page(request: Request, table: str = Query(default="")):
+    conn = with_conn()
+    try:
+        state = backfill.state(conn, settings.TABLE_NAMES)
+    finally:
+        conn.close()
+    selected = table if table in state else settings.TABLE_NAMES[0]
+    return render(
+        request,
+        "backfill.html",
+        page="backfill",
+        nav="backfill",
+        state=state,
+        selected=selected,
+        reason_labels=backfill.REASON_LABELS,
+        status_labels=backfill.STATUS_LABELS,
+        pending_total=sum(item["pending_count"] for item in state.values()),
     )
 
 
@@ -201,6 +245,7 @@ def review(request: Request, run_id: str | None = None, kind: str = Query(defaul
         selected = store.get_run(conn, run_id) if run_id else (
             store.get_run(conn, runs[0]["run_id"]) if runs else None
         )
+        pending_state = backfill.state(conn, settings.TABLE_NAMES)
     finally:
         conn.close()
     entries: list[dict] = []
@@ -222,6 +267,8 @@ def review(request: Request, run_id: str | None = None, kind: str = Query(defaul
         kinds=kinds,
         active_kind=kind,
         run_count=len(runs),
+        backfill_state=pending_state,
+        pending_total=sum(item["pending_count"] for item in pending_state.values()),
     )
 
 
@@ -232,7 +279,10 @@ def review(request: Request, run_id: str | None = None, kind: str = Query(defaul
 def api_merge(payload: MergeRequest):
     conn = with_conn()
     try:
-        run = runner.execute(conn, payload.tables, payload.schema_version)
+        run = runner.execute(
+            conn, payload.tables, payload.schema_version,
+            use_published=payload.mode != "direct",
+        )
     except runner.RunError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except schema_gate.SchemaError as exc:
@@ -241,16 +291,113 @@ def api_merge(payload: MergeRequest):
         raise HTTPException(status_code=422, detail=f"样例事件解析失败：{exc}") from exc
     finally:
         conn.close()
+    summary = dict(run["summary"])
     return JSONResponse(
         {
             "run_id": run["run_id"],
-            "summary": run["summary"],
+            "summary": summary,
             "tables": run["tables"],
             "schema_version": run["schema_version"],
+            "mode": run["result"].get("mode", "direct"),
+            "pending": summary.get("pending", 0),
             "result_url": f"/result/{run['run_id']}",
             "snapshot_url": f"/api/runs/{run['run_id']}/snapshot",
+            "backfill_url": "/backfill",
         }
     )
+
+
+@app.post("/api/backfill")
+def api_backfill(payload: BackfillRequest):
+    """把指定表的待补事件按业务时间补齐，并在同一事务里切换结果与水位线。"""
+    if payload.table not in settings.TABLE_NAMES:
+        raise HTTPException(status_code=400, detail=f"未知的表：{payload.table}")
+    conn = with_conn()
+    try:
+        detail = backfill.apply_batch(
+            conn,
+            payload.table,
+            payload.cutoff,
+            payload.schema_version,
+            simulate_failure=payload.simulate_failure,
+            batch_key=payload.batch_key,
+        )
+    except backfill.BackfillError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        conn.close()
+    return JSONResponse(
+        {
+            "batch_key": detail["batch_key"],
+            "table": detail["table"],
+            "status": detail["status"],
+            "reused": detail.get("reused", False),
+            "attempts": detail.get("attempts"),
+            "replayed": detail.get("replayed"),
+            "version_no": detail.get("version_no"),
+            "version_before": detail.get("version_before"),
+            "watermark_before": detail.get("watermark_before"),
+            "watermark_after": detail.get("watermark_after"),
+            "pending_before": detail.get("pending_before"),
+            "pending_after": detail.get("pending_after"),
+            "affected_keys": detail.get("affected_keys", []),
+            "reasons": detail.get("reasons", []),
+            "result": detail.get("result", {}),
+            "backfill_url": "/backfill",
+        }
+    )
+
+
+@app.get("/api/backfill/state")
+def api_backfill_state():
+    conn = with_conn()
+    try:
+        state = backfill.state(conn, settings.TABLE_NAMES)
+    finally:
+        conn.close()
+    return {
+        "tables": {
+            table: {
+                "current": None if item["current"] is None else {
+                    key: item["current"][key]
+                    for key in ("version_id", "version_no", "watermark", "batch_key",
+                                "source", "created_at")
+                },
+                "pending_count": item["pending_count"],
+                "applied_count": item["applied_count"],
+                "oldest_pending_ts": item["oldest_pending_ts"],
+                "pending": [
+                    {key: row[key] for key in
+                     ("id", "line_no", "pk", "version", "ts", "op", "reason",
+                      "reason_label", "boundary", "status", "detail", "tombstone_version")}
+                    for row in item["pending"]
+                ],
+                "batches": [
+                    {key: row[key] for key in
+                     ("batch_key", "status", "status_label", "created_at", "version_no",
+                      "version_before", "watermark_before", "watermark_after",
+                      "pending_before", "pending_after", "attempts", "replayed",
+                      "error", "reasons", "affected_keys")}
+                    for row in item["batches"]
+                ],
+                "versions": [
+                    {
+                        "version_no": entry["version"]["version_no"],
+                        "version_id": entry["version"]["version_id"],
+                        "batch_key": entry["version"]["batch_key"],
+                        "source": entry["version"]["source"],
+                        "watermark": entry["version"]["watermark"],
+                        "created_at": entry["version"]["created_at"],
+                        "row_count": entry["version"]["counters"].get("alive_rows"),
+                        "tombstone_count": entry["version"]["counters"].get("tombstones"),
+                        "watermark_before": (entry["batch"] or {}).get("watermark_before"),
+                    }
+                    for entry in item["versions"]
+                ],
+            }
+            for table, item in state.items()
+        }
+    }
 
 
 @app.get("/api/runs")

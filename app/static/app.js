@@ -172,22 +172,30 @@
 
   function renderSummary(data) {
     var s = data.summary;
+    var published = (s.published_version || {});
+    var versionText = Object.keys(published).map(function (table) {
+      return table + ' v' + published[table];
+    }).join(' · ') || '—';
     metricsBox.innerHTML = '';
     metricsBox.appendChild(kpi(s.alive_rows, '合并后最终行数', '存活键'));
     metricsBox.appendChild(kpi(s.conflicts, '同版本冲突', '需人工裁决'));
-    metricsBox.appendChild(kpi(s.late, '迟到事件', '含墓碑后忽略 ' + s.ignored_after_tombstone));
+    metricsBox.appendChild(kpi(s.pending || 0, '待补迟到事件', '未改写已发布结果'));
     metricsBox.appendChild(kpi(s.watermark, '全局水位线（UTC）', 'min(每键最大 ts)'));
     metricsBox.appendChild(kpi(s.open_keys, '未闭合键', '水位线之上'));
     metricsBox.appendChild(kpi(s.tombstones, '删除墓碑', '保留不清理'));
-    metricsBox.appendChild(kpi(s.ignored_after_tombstone, '墓碑后忽略', '低版本不再改状态'));
+    metricsBox.appendChild(kpi(s.pending_tombstone || 0, '待补中的墓碑后事件', '补入时按墓碑规则忽略'));
     metricsBox.appendChild(kpi(s.deduped_silent, '同内容静默去重', '不计冲突'));
+    metricsBox.appendChild(kpi(versionText, '已发布版本', '每表一条发布指针'));
     metricsBox.appendChild(kpi(VERDICT_ZH[s.gate_verdict] || s.gate_verdict, '门禁总判定', '逐条理由见结果页'));
 
     var counts = s.gate_counts || {};
+    var reasons = s.pending_reasons || {};
     gateBox.textContent =
       '门禁：可放行 ' + (counts.compatible || 0) + ' 条 · 放行+回填 ' +
       (counts.compatible_with_backfill || 0) + ' 条 · 阻断 ' + (counts.blocked || 0) +
-      ' 条。已合并表：' + data.tables.join(' / ') + '（目标 schema v' + data.schema_version + '）。';
+      ' 条。已合并表：' + data.tables.join(' / ') + '（目标 schema v' + data.schema_version + '）。' +
+      ' 本次 ' + (s.pending || 0) + ' 条迟到事件进入待补队列（水位线以内 ' + (reasons.within_watermark || 0) +
+      ' 条 · 边界外 ' + (reasons.late_arrival || 0) + ' 条），补齐前不改写已发布结果。';
     resultLink.href = data.result_url;
     snapshotLink.href = data.snapshot_url;
     summaryCard.hidden = false;
@@ -228,5 +236,126 @@
       btn.disabled = false;
       btn.textContent = label;
     }
+  });
+})();
+
+// --- 待补队列：补齐并切换（结果与水位线同批） ----------------------------
+(function () {
+  var form = document.getElementById('backfill-form');
+  if (!form) return;
+
+  var btn = document.getElementById('backfill-btn');
+  var allBtn = document.getElementById('backfill-all-btn');
+  var errBox = document.getElementById('backfill-error');
+  var resultPanel = document.getElementById('backfill-result');
+  var title = document.getElementById('batch-title');
+  var summary = document.getElementById('batch-summary');
+  var changes = document.getElementById('batch-changes');
+  var tableSelect = document.getElementById('backfill-table');
+  var cutoffInput = document.getElementById('backfill-cutoff');
+  var schemaSelect = document.getElementById('backfill-schema');
+  var failInput = document.getElementById('backfill-fail');
+
+  function esc(value) {
+    return String(value === null || value === undefined ? '—' : value)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function stateCell(state) {
+    if (!state) return '<span class="muted">不存在</span>';
+    if (state.deleted) {
+      return '<span class="tag err">墓碑 v' + esc(state.tombstone_version) + '</span>' +
+        '<div class="small muted mono">第 ' + esc(state.tombstone_line_no) + ' 行</div>';
+    }
+    return '<span class="tag ok">存活 v' + esc(state.version) + '</span>' +
+      '<div class="small mono">' + esc(state.ts) + '</div>' +
+      '<div class="small muted mono">' + esc(JSON.stringify(state.after || {})) + '</div>';
+  }
+
+  function render(data) {
+    var result = data.result || {};
+    title.textContent = '批次 ' + data.batch_key + (data.reused ? ' · 复用原版本（未新增）' : ' · 已切换');
+    summary.innerHTML =
+      '<p class="small" style="margin:0 0 6px">' +
+      '<strong>表：</strong>' + esc(data.table) +
+      ' · <strong>版本：</strong>v' + esc(data.version_before) + ' → v' + esc(data.version_no) +
+      ' · <strong>状态：</strong>' + esc(data.status) +
+      ' · <strong>尝试：</strong>' + esc(data.attempts) + '（复用 ' + esc(data.replayed) + '）' +
+      '</p>' +
+      '<p class="small" style="margin:0 0 6px">' +
+      '<strong>水位线：</strong><span class="mono">' + esc(data.watermark_before) + '</span> → ' +
+      '<span class="mono">' + esc(data.watermark_after) + '</span>' +
+      ' · <strong>待补：</strong>' + esc(data.pending_before) + ' → ' + esc(data.pending_after) +
+      ' · <strong>受影响键：</strong>' + esc((data.affected_keys || []).join('、')) +
+      ' · <strong>待补原因：</strong>' + esc((data.reasons || []).join('、')) +
+      '</p>' +
+      '<p class="small muted" style="margin:0">' +
+      '最终行 ' + esc(result.rows_before) + ' → ' + esc(result.rows_after) +
+      ' · 墓碑 ' + esc(result.tombstones_before) + ' → ' + esc(result.tombstones_after) +
+      ' · 变更键 ' + esc(result.changed_keys) + ' / 未变 ' + esc(result.unchanged_keys) + '</p>';
+
+    var rows = (result.changes || []).map(function (item) {
+      var fields = (item.changed_fields || []).join('、') || '—';
+      return '<tr class="' + (item.changed ? 'row-conflict' : '') + '">' +
+        '<td class="mono">' + esc(item.pk) + '</td>' +
+        '<td class="small">' + esc(item.change_type) + '</td>' +
+        '<td class="small">' + esc(fields) + '</td>' +
+        '<td class="small">' + stateCell(item.before) + '</td>' +
+        '<td class="small">' + stateCell(item.after) + '</td>' +
+        '</tr>';
+    }).join('');
+
+    var tombstones = (result.tombstones_preserved || []).map(function (item) {
+      return '<code>' + esc(item.pk) + '</code> 墓碑 v' + esc(item.tombstone_version) +
+        '（第 ' + esc(item.tombstone_line_no) + ' 行）';
+    }).join('、') || '无';
+    var conflicts = (result.conflicts_preserved || []).map(function (item) {
+      return '<code>' + esc(item.pk) + '</code> v' + esc(item.version) + '（字段 ' + esc((item.diff || []).join('、')) + '）';
+    }).join('、') || '无';
+
+    changes.innerHTML =
+      '<table class="dense"><thead><tr><th>键</th><th>变化</th><th>变化字段</th><th>补前最终结果</th><th>补后最终结果</th></tr></thead>' +
+      '<tbody>' + (rows || '<tr><td colspan="5" class="muted">本批没有受影响键。</td></tr>') + '</tbody></table>' +
+      '<div class="panel-body tight"><p class="small muted" style="margin:0">' +
+      '<strong>保留的墓碑：</strong>' + tombstones + '<br><strong>保留的冲突：</strong>' + conflicts +
+      '</p></div>';
+    resultPanel.hidden = false;
+    resultPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  async function submit(cutoff) {
+    errBox.hidden = true;
+    btn.disabled = true;
+    allBtn.disabled = true;
+    var label = btn.textContent;
+    btn.textContent = '补齐中…';
+    try {
+      var data = await window.postJSON('/api/backfill', {
+        table: tableSelect.value,
+        cutoff: cutoff,
+        schema_version: Number(schemaSelect.value),
+        simulate_failure: !!(failInput && failInput.checked)
+      });
+      render(data);
+      if (!data.reused) {
+        setTimeout(function () { window.location.reload(); }, 1200);
+      }
+    } catch (err) {
+      window.showError(errBox, err);
+    } finally {
+      btn.disabled = false;
+      allBtn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+
+  form.addEventListener('submit', function (event) {
+    event.preventDefault();
+    submit(cutoffInput.value.trim() || null);
+  });
+
+  allBtn.addEventListener('click', function () {
+    cutoffInput.value = '';
+    submit(null);
   });
 })();

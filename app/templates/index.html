@@ -42,6 +42,11 @@
     <div class="k-value">{{ stats.last_conflicts }}</div>
     <div class="k-note">同版本不同内容，需人工裁决</div>
   </div>
+  <div class="kpi {% if pending_total %}warn{% endif %}">
+    <div class="k-label">待补队列</div>
+    <div class="k-value">{{ pending_total }}</div>
+    <div class="k-note">按业务时间排队，补齐前不改写结果</div>
+  </div>
 </div>
 
 <section class="panel">
@@ -52,13 +57,13 @@
   <div class="panel-body tight">
     <p class="small muted" style="margin:0 0 8px">
       样例里故意埋了 3 组同版本冲突、2 个删除墓碑、8 条迟到（含 2 条墓碑后迟到）与 1 条同内容重复，
-      跑一次就能看到全部判定路径；门禁结论逐条给理由。
+      跑一次就能看到全部判定路径；迟到事件只进待补队列，不直接改写已发布结果。
     </p>
     <p class="small" style="margin:0">
       <a class="btn small" href="/workbench">执行合并</a>
       {% if recent %}<a class="btn secondary small" href="/result/{{ recent[0].run_id }}">看最近一次结果</a>{% endif %}
+      <a class="btn secondary small" href="/backfill">待补队列（{{ pending_total }}）</a>
       <a class="btn secondary small" href="/review">复核与导出</a>
-      <a class="btn secondary small" href="/workbench#m4">看水位线口径</a>
     </p>
   </div>
 </section>
@@ -154,8 +159,8 @@
   </div>
   <div class="panel-body tight">
     <p class="small muted" style="margin:0">
-      迟到共 8 条，其中 2 条（orders / inventory 的第 58 行）同时属于「墓碑后迟到」，
-      因此它们既计入迟到数，也计入 <code>ignored_after_tombstone</code>。
+      迟到共 8 条，全部按业务时间进入待补队列；其中 2 条（orders / inventory 的第 58 行）同时属于「墓碑后迟到」，
+      补入时仍按墓碑规则忽略，但事件与墓碑都保留。
       完整业务背景、五条核心规则、演示步骤与样例埋点见下方折叠。
     </p>
   </div>
@@ -193,7 +198,8 @@
     <li><strong>删除墓碑：</strong><code>op=d</code> 且版本高于后续 c/u → 键判删除；墓碑必须保留；
       墓碑后到达的低版本 c/u 一律忽略并计入 <code>ignored_after_tombstone</code>。</li>
     <li><strong>乱序与迟到：</strong>按到达顺序处理，<code>ts</code> 小于「当前已处理最大 ts」即为迟到；
-      迟到事件仍按版本规则参与合并，并记录表名 + 文件行号。</li>
+      迟到事件按业务时间进入待补队列，补齐同键边界前事件后，才原子切换最终结果与水位线；
+      失败保留旧版本，同一批重试不新增版本。</li>
     <li><strong>水位线：</strong><code>watermark = min(每个键已处理事件的最大 ts)</code>，
       水位线及以下的键视为已闭合，输出全局/分表水位线与未闭合键数。</li>
     <li><strong>Schema 门禁：</strong>新增 nullable 列 → 可放行；新增列带默认值 → 放行 + 回填；
